@@ -1,11 +1,11 @@
 [package]
 edition      = "2024"
-name         = "adhd_timer"
+name         = "pomodoro_cube"
 rust-version = "1.88"
 version      = "0.1.0"
 
 [[bin]]
-name = "adhd_timer"
+name = "pomodoro_cube"
 path = "./src/bin/main.rs"
 
 [dependencies]
@@ -28,6 +28,9 @@ esp-println      = { version = "0.16", features = ["esp32s3", "log-04"] }
 
 critical-section = "1.2"
 static_cell      = "2.1"
+
+smart-leds       = "0.4"
+esp-hal-smartled = { version = "0.17", features = ["esp32s3"] }
 
 
 [profile.dev]
