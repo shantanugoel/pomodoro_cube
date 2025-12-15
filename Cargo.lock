@@ -984,6 +984,7 @@ dependencies = [
  "critical-section",
  "embassy-executor",
  "embassy-time",
+ "embedded-hal 1.0.0",
  "esp-alloc",
  "esp-bootloader-esp-idf",
  "esp-hal",

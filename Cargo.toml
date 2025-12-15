@@ -31,6 +31,7 @@ static_cell      = "2.1"
 
 smart-leds       = "0.4"
 esp-hal-smartled = { version = "0.17", features = ["esp32s3"] }
+embedded-hal = "1"
 
 
 [profile.dev]

@@ -10,6 +10,9 @@
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
+use esp_hal::i2c::master::{Config, I2c};
+use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
+use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use log::info;
 
@@ -34,13 +37,34 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_println::logger::init_logger_from_env();
 
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    // System Init
+    // Set CPU to 80MHz to save power
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_80MHz);
     let peripherals = esp_hal::init(config);
 
+    // Runtime Init
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
-
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
+
+    // Hardware Init
+    //LEDs
+    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("Failed to initialize RMT0");
+    let tx_config = TxChannelConfig::default();
+    let _tx_channel = rmt
+        .channel0
+        .configure_tx(peripherals.GPIO4, tx_config)
+        .expect("Failed to create RMT TX Channel");
+
+    // IMU
+    let _i2c = I2c::new(
+        peripherals.I2C0,
+        Config::default().with_frequency(Rate::from_khz(400)),
+    )
+    .expect("Failed to create I2c")
+    .with_sda(peripherals.GPIO11)
+    .with_scl(peripherals.GPIO12);
+    // TODO: Actual IMU init here after writing the driver
 
     info!("Embassy initialized!");
 
