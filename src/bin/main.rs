@@ -135,6 +135,7 @@ async fn main(spawner: Spawner) -> ! {
 // TODO: Implement a sand grain falling animation during the timer countdown
 // TODO: Implement orientation based direction of filling the LEDs (so it fills "downwards" based on cube orientation)
 // TODO: Implement light or deep sleep between readings and after completion to save power. Wake up if orientation changes
+// TODO: Stop the timer after it completes and wait for user to move the cube to restart
 // TODO: Detect if orientation changed to another valid one during countdown, and pause timer until settled
 //   and use the new orientation to restart the timer if the orientation changed from previous one
 async fn run_timer<S>(minutes: u32, leds: &mut S, color: RGB8)
