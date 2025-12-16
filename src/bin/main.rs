@@ -11,6 +11,7 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
+use esp_hal::gpio::{Input, InputConfig, Pull};
 use esp_hal::i2c::master::{Config, I2c};
 use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::rtc_cntl::{Rtc, sleep::TimerWakeupSource};
@@ -18,7 +19,7 @@ use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal_smartled::SmartLedsAdapter;
 use log::info;
-use pomodoro_cube::qmi8658;
+use pomodoro_cube::qmi8658::{self, WomInterrupt};
 use smart_leds::{RGB8, SmartLedsWrite};
 
 use core::time::Duration as CoreDuration;
@@ -33,6 +34,12 @@ const GRAVITY_THRESHOLD: f32 = 0.85;
 // Buffer Size: 64 LEDs * 24 bits (R,G,B) + 1 Stop Code
 const BUFFER_SIZE: usize = 64 * 24 + 1;
 
+// Wake-on-Motion threshold in mg (1mg/LSB). Lower = more sensitive.
+// 100mg is a good balance for detecting cube rotation without false triggers.
+const WOM_THRESHOLD_MG: u8 = 100;
+// Number of accelerometer samples to ignore when enabling WoM (avoids spurious triggers)
+const WOM_BLANKING_SAMPLES: u8 = 10;
+
 // Light sleep can disrupt `espflash monitor` (USB-Serial-JTAG/CDC) because the USB link may drop
 // while the chip sleeps. Keep this OFF while developing/debugging over USB.
 const USE_LIGHT_SLEEP: bool = false;
@@ -43,6 +50,80 @@ enum FillDirection {
     Up,
     Left,
     Right,
+}
+
+/// Represents the detected cube orientation based on accelerometer readings.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Orientation {
+    /// Y- is down (5 minutes)
+    YNeg,
+    /// X- is down (15 minutes)
+    XNeg,
+    /// X+ is down (30 minutes)
+    XPos,
+    /// Y+ is down (60 minutes)
+    YPos,
+    /// Z axis is dominant (ignored)
+    ZAxis,
+    /// Ambiguous/transitioning
+    Unknown,
+}
+
+impl Orientation {
+    /// Get timer duration in minutes for this orientation, if valid.
+    fn timer_minutes(self) -> Option<u32> {
+        match self {
+            Orientation::YNeg => Some(5),
+            Orientation::XNeg => Some(15),
+            Orientation::XPos => Some(30),
+            Orientation::YPos => Some(60),
+            Orientation::ZAxis | Orientation::Unknown => None,
+        }
+    }
+
+    /// Get the fill direction for LED animation.
+    fn fill_direction(self) -> FillDirection {
+        match self {
+            Orientation::YNeg => FillDirection::Right,
+            Orientation::XNeg => FillDirection::Up,
+            Orientation::XPos => FillDirection::Down,
+            Orientation::YPos => FillDirection::Left,
+            Orientation::ZAxis | Orientation::Unknown => FillDirection::Down,
+        }
+    }
+
+    /// Get the LED color for this orientation.
+    fn color(self) -> RGB8 {
+        match self {
+            Orientation::YNeg => COLOR_5_MIN,
+            Orientation::XNeg => COLOR_15_MIN,
+            Orientation::XPos => COLOR_30_MIN,
+            Orientation::YPos => COLOR_60_MIN,
+            Orientation::ZAxis | Orientation::Unknown => COLOR_BG,
+        }
+    }
+
+    /// Returns true if this is a valid timer orientation.
+    fn is_valid_timer_orientation(self) -> bool {
+        self.timer_minutes().is_some()
+    }
+}
+
+/// Determine orientation from accelerometer readings.
+fn detect_orientation(x: f32, y: f32, z: f32) -> Orientation {
+    if y < -GRAVITY_THRESHOLD {
+        Orientation::YNeg
+    } else if x < -GRAVITY_THRESHOLD {
+        Orientation::XNeg
+    } else if x > GRAVITY_THRESHOLD {
+        Orientation::XPos
+    } else if y > GRAVITY_THRESHOLD {
+        Orientation::YPos
+    } else if !(-GRAVITY_THRESHOLD..=GRAVITY_THRESHOLD).contains(&z) {
+        Orientation::ZAxis
+    } else {
+        Orientation::Unknown
+    }
 }
 
 #[panic_handler]
@@ -105,96 +186,340 @@ async fn main(spawner: Spawner) -> ! {
         info!("QMI8658 initialized successfully");
     }
 
+    // IMU interrupt pin (INT2) - used for Wake-on-Motion
+    // Common pins on Waveshare ESP32-S3-Matrix: GPIO10 or GPIO13
+    let mut imu_int = Input::new(
+        peripherals.GPIO13,
+        InputConfig::default().with_pull(Pull::Down),
+    );
+
     info!("Initialized!");
 
-    // TODO: Spawn some tasks
     let _ = spawner;
 
-    loop {
-        // Read all 3 axes (X, Y, Z)
-        if let Ok((x, y, z)) = imu.read_accel_all() {
-            // Check which axis is feeling gravity (> 0.85g or < -0.85g)
-            // Gravity pulls "Down", so the sensor reads +1g or -1g depending on orientation.
-            info!("X: {:.2}g, Y: {:.2}g, Z: {:.2}g", x, y, z);
+    // On first boot, wait for user to pick up/move the cube before starting
+    info!("Waiting for initial motion to start...");
+    wait_for_motion_wom(&mut imu, &mut imu_int).await;
+    info!("Motion detected, ready to start!");
 
-            // TODO: Maybe use Z axis for power down to give an additional time option?
-            // TODO: Batch logging to reduce log spam
-            if y < -GRAVITY_THRESHOLD {
-                // --- CASE 1: Y- is DOWN ---
-                // ACTION: 5 MINUTES
-                info!("5 MINUTES");
-                flash_color(&mut led_strip, COLOR_5_MIN).await;
-                run_timer(
-                    5,
-                    &mut led_strip,
-                    COLOR_5_MIN,
-                    FillDirection::Right,
-                    &mut rtc,
-                )
-                .await;
-            } else if x < -GRAVITY_THRESHOLD {
-                // --- CASE 2: X- is DOWN ---
-                // ACTION: 15 MINUTES
-                info!("15 MINUTES");
-                flash_color(&mut led_strip, COLOR_15_MIN).await;
-                run_timer(
-                    15,
-                    &mut led_strip,
-                    COLOR_15_MIN,
-                    FillDirection::Up,
-                    &mut rtc,
-                )
-                .await;
-            } else if x > GRAVITY_THRESHOLD {
-                // --- CASE 3: X+ is DOWN ---
-                // ACTION: 30 MINUTES
-                info!("30 MINUTES");
-                flash_color(&mut led_strip, COLOR_30_MIN).await;
-                run_timer(
-                    30,
-                    &mut led_strip,
-                    COLOR_30_MIN,
-                    FillDirection::Down,
-                    &mut rtc,
-                )
-                .await;
-            } else if y > GRAVITY_THRESHOLD {
-                // --- CASE 4: Y+ is DOWN ---
-                // ACTION: 60 MINUTES
-                info!("60 MINUTES");
-                flash_color(&mut led_strip, COLOR_60_MIN).await;
-                run_timer(
-                    60,
-                    &mut led_strip,
-                    COLOR_60_MIN,
-                    FillDirection::Left,
-                    &mut rtc,
-                )
-                .await;
-            } else if !(-GRAVITY_THRESHOLD..=GRAVITY_THRESHOLD).contains(&z) {
-                // --- CASE 5: Z is DOWN/UP ---
-                // ACTION: Do nothing / ignore
-                info!("IGNORING Z-AXIS ORIENTATION");
-                //TODO: Maybe go to light sleep until orientation changes?
-            } else {
-                // --- AMBIGUOUS / TRANSITION ---
-                // Waiting for box to settle
-                info!("SETTLING");
-                Timer::after(Duration::from_millis(200)).await;
+    loop {
+        // Wait for a valid orientation to start a timer
+        let orientation = wait_for_valid_orientation(&mut imu).await;
+
+        let minutes = orientation.timer_minutes().unwrap();
+        let color = orientation.color();
+
+        info!("{} MINUTES timer starting", minutes);
+        flash_color(&mut led_strip, color).await;
+
+        // Run the timer with orientation change detection
+        let result = run_timer_with_motion_detection(
+            minutes,
+            orientation,
+            &mut led_strip,
+            &mut imu,
+            &mut rtc,
+        )
+        .await;
+
+        match result {
+            TimerResult::Completed => {
+                info!("Timer completed! Waiting for cube to be moved...");
+                // Timer finished - wait for user to move the cube before allowing restart
+                wait_for_motion_wom(&mut imu, &mut imu_int).await;
+                info!("Motion detected, checking new orientation...");
             }
-        } else {
-            // Sensor error retry
-            info!("Sensor read error, retrying...");
-            Timer::after(Duration::from_millis(100)).await;
+            TimerResult::OrientationChanged(new_orientation) => {
+                info!(
+                    "Orientation changed during timer to {:?}, restarting...",
+                    new_orientation
+                );
+                // The main loop will pick up the new orientation on next iteration
+            }
         }
     }
 }
 
-// TODO: Go to light or deep sleep after the grain reaches its position till next grain needs to appear
-// TODO: Implement light or deep sleep between readings and after completion to save power. Wake up if orientation changes
-// TODO: Stop the timer after it completes and wait for user to move the cube to restart
-// TODO: Detect if orientation changed to another valid one during countdown, and pause timer until settled
-//   and use the new orientation to restart the timer if the orientation changed from previous one
+/// Result of a timer run
+enum TimerResult {
+    /// Timer completed successfully
+    Completed,
+    /// Orientation changed during countdown to a new valid orientation
+    OrientationChanged(Orientation),
+}
+
+/// Wait until the cube is in a valid timer orientation (stable).
+async fn wait_for_valid_orientation<I, E>(imu: &mut qmi8658::Qmi8658<I>) -> Orientation
+where
+    I: embedded_hal::i2c::I2c<Error = E>,
+{
+    loop {
+        if let Ok((x, y, z)) = imu.read_accel_all() {
+            let orientation = detect_orientation(x, y, z);
+            if orientation.is_valid_timer_orientation() {
+                // Wait a bit to confirm it's stable
+                Timer::after(Duration::from_millis(300)).await;
+
+                // Re-check
+                if let Ok((x2, y2, z2)) = imu.read_accel_all() {
+                    let orientation2 = detect_orientation(x2, y2, z2);
+                    if orientation == orientation2 {
+                        return orientation;
+                    }
+                }
+            } else {
+                match orientation {
+                    Orientation::ZAxis => {
+                        info!("Z-axis orientation (ignored), waiting...");
+                    }
+                    Orientation::Unknown => {
+                        info!("Settling...");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Timer::after(Duration::from_millis(200)).await;
+    }
+}
+
+/// Enable Wake-on-Motion and wait for an interrupt indicating motion.
+/// Falls back to polling if interrupt doesn't arrive within timeout.
+#[allow(clippy::large_stack_frames)]
+async fn wait_for_motion_wom<I, E>(imu: &mut qmi8658::Qmi8658<I>, int_pin: &mut Input<'_>)
+where
+    I: embedded_hal::i2c::I2c<Error = E>,
+{
+    // Enable WoM on INT2 (initial value low, so it goes high on motion)
+    if let Err(_e) = imu.enable_wake_on_motion(
+        WOM_THRESHOLD_MG,
+        WomInterrupt::Int2Low,
+        WOM_BLANKING_SAMPLES,
+    ) {
+        info!("Failed to enable WoM, falling back to polling");
+        wait_for_motion_polling(imu).await;
+        return;
+    }
+
+    info!("WoM enabled, waiting for motion interrupt...");
+    info!("If no interrupt arrives in 5 seconds, will fall back to polling");
+
+    // Wait for interrupt with timeout
+    // The INT pin might not be connected on all boards
+    let interrupt_received =
+        embassy_time::with_timeout(Duration::from_secs(5), int_pin.wait_for_any_edge())
+            .await
+            .is_ok();
+
+    if interrupt_received {
+        info!("WoM interrupt received!");
+        // Clear the WoM status by reading STATUS1
+        let _ = imu.check_wom_event();
+    } else {
+        info!("No interrupt received - INT pin may not be connected");
+        info!("Falling back to polling mode for motion detection");
+
+        // Disable WoM first
+        if let Err(_e) = imu.disable_wake_on_motion() {
+            info!("Failed to disable WoM");
+        }
+
+        // Fall back to polling
+        wait_for_motion_polling(imu).await;
+        return;
+    }
+
+    // Disable WoM and restore normal operation
+    if let Err(_e) = imu.disable_wake_on_motion() {
+        info!("Failed to disable WoM, continuing anyway");
+    }
+}
+
+/// Fallback method: Poll accelerometer to detect motion when interrupt isn't available.
+async fn wait_for_motion_polling<I, E>(imu: &mut qmi8658::Qmi8658<I>)
+where
+    I: embedded_hal::i2c::I2c<Error = E>,
+{
+    // Read baseline
+    let baseline = if let Ok((x, y, z)) = imu.read_accel_all() {
+        (x, y, z)
+    } else {
+        info!("Failed to read baseline, waiting 1s");
+        Timer::after(Duration::from_secs(1)).await;
+        return;
+    };
+
+    info!("Polling for motion (move the cube to continue)...");
+
+    // Poll for significant change
+    loop {
+        Timer::after(Duration::from_millis(100)).await;
+
+        if let Ok((x, y, z)) = imu.read_accel_all() {
+            // Check if any axis changed significantly (> 0.3g = 30% of gravity)
+            let dx = (x - baseline.0).abs();
+            let dy = (y - baseline.1).abs();
+            let dz = (z - baseline.2).abs();
+
+            if dx > 0.3 || dy > 0.3 || dz > 0.3 {
+                info!("Motion detected via polling!");
+                return;
+            }
+        }
+    }
+}
+
+/// Run the timer with periodic orientation change detection.
+/// Returns `TimerResult::Completed` if the timer finishes normally,
+/// or `TimerResult::OrientationChanged(new_orientation)` if the cube was rotated.
+#[allow(clippy::large_stack_frames)]
+async fn run_timer_with_motion_detection<S, I, E>(
+    minutes: u32,
+    original_orientation: Orientation,
+    leds: &mut S,
+    imu: &mut qmi8658::Qmi8658<I>,
+    rtc: &mut Rtc<'_>,
+) -> TimerResult
+where
+    S: SmartLedsWrite,
+    S::Color: From<RGB8>,
+    I: embedded_hal::i2c::I2c<Error = E>,
+{
+    let color = original_orientation.color();
+    let dir = original_orientation.fill_direction();
+    let total_seconds = minutes * 60;
+
+    // Initial render: empty matrix.
+    render_sand_state(leds, 0, None, color, dir);
+
+    let mut elapsed: u32 = 0;
+
+    while elapsed < total_seconds {
+        let filled_now = filled_pixels(elapsed, total_seconds);
+        if filled_now >= 64 {
+            break;
+        }
+
+        // Compute when the next pixel should be added.
+        let next_elapsed = next_elapsed_for_filled(filled_now + 1, total_seconds);
+        if next_elapsed <= elapsed {
+            elapsed += 1;
+            continue;
+        }
+
+        let sleep_duration = next_elapsed - elapsed;
+
+        // Instead of sleeping the full duration, sleep in shorter intervals
+        // and check orientation periodically (every ~1 second).
+        let check_interval = 1u32; // Check orientation every second
+        let mut remaining = sleep_duration;
+
+        while remaining > 0 {
+            let sleep_time = remaining.min(check_interval);
+
+            if USE_LIGHT_SLEEP && sleep_time > 1 {
+                light_sleep_secs(rtc, sleep_time);
+            } else {
+                Timer::after(Duration::from_secs(sleep_time as u64)).await;
+            }
+
+            remaining = remaining.saturating_sub(sleep_time);
+
+            // Check if orientation changed
+            if let Ok((x, y, z)) = imu.read_accel_all() {
+                let current_orientation = detect_orientation(x, y, z);
+
+                if current_orientation != original_orientation {
+                    if current_orientation.is_valid_timer_orientation() {
+                        // Orientation changed to a different valid position
+                        // Wait briefly to confirm it's stable
+                        Timer::after(Duration::from_millis(300)).await;
+
+                        if let Ok((x2, y2, z2)) = imu.read_accel_all() {
+                            let confirmed_orientation = detect_orientation(x2, y2, z2);
+                            if confirmed_orientation == current_orientation {
+                                info!(
+                                    "Orientation changed from {:?} to {:?}",
+                                    original_orientation, current_orientation
+                                );
+                                // Clear LEDs before returning
+                                fill_matrix(leds, COLOR_BG);
+                                return TimerResult::OrientationChanged(current_orientation);
+                            }
+                        }
+                    } else if current_orientation == Orientation::ZAxis {
+                        // Cube flipped to Z-axis (stop position) - pause timer and wait
+                        info!("Z-axis detected - pausing timer...");
+                        fill_matrix(leds, COLOR_BG);
+
+                        // Wait for cube to settle back to original orientation or a new valid one
+                        loop {
+                            Timer::after(Duration::from_millis(200)).await;
+                            if let Ok((x3, y3, z3)) = imu.read_accel_all() {
+                                let settled_orientation = detect_orientation(x3, y3, z3);
+                                if settled_orientation == original_orientation {
+                                    // Back to original - resume timer
+                                    info!("Back to original orientation, resuming timer...");
+                                    render_sand_state(leds, filled_now, None, color, dir);
+                                    break;
+                                } else if settled_orientation.is_valid_timer_orientation() {
+                                    // Settled to a different timer orientation
+                                    info!("Changed to new orientation, restarting timer...");
+                                    return TimerResult::OrientationChanged(settled_orientation);
+                                } else if settled_orientation == Orientation::ZAxis {
+                                    // Still on Z-axis, keep waiting
+                                    continue;
+                                }
+                                // Unknown orientation, keep waiting to settle
+                            }
+                        }
+                    } else if current_orientation == Orientation::Unknown {
+                        // Cube is being moved - pause and wait for it to settle
+                        info!("Cube moving, pausing timer...");
+                        fill_matrix(leds, COLOR_BG);
+
+                        // Wait for cube to settle back to original orientation or a new one
+                        loop {
+                            Timer::after(Duration::from_millis(200)).await;
+                            if let Ok((x3, y3, z3)) = imu.read_accel_all() {
+                                let settled_orientation = detect_orientation(x3, y3, z3);
+                                if settled_orientation == original_orientation {
+                                    // Back to original - resume timer
+                                    info!("Back to original orientation, resuming...");
+                                    render_sand_state(leds, filled_now, None, color, dir);
+                                    break;
+                                } else if settled_orientation.is_valid_timer_orientation() {
+                                    // Settled to a different orientation
+                                    return TimerResult::OrientationChanged(settled_orientation);
+                                } else if settled_orientation == Orientation::ZAxis {
+                                    // Settled to Z-axis (stop position)
+                                    info!("Z-axis detected - timer paused");
+                                    // Will loop and keep waiting
+                                }
+                                // Still settling or unknown, keep waiting
+                            }
+                        }
+                    }
+                    // Other orientations handled above
+                }
+            }
+        }
+
+        elapsed = next_elapsed;
+
+        let filled_after = filled_pixels(elapsed, total_seconds);
+        if filled_after > filled_now {
+            let target_fill_index = filled_after - 1;
+            animate_grain_to_fill_index(leds, target_fill_index, filled_after, color, dir).await;
+        }
+    }
+
+    // Timer completed successfully
+    run_breathing_animation(leds, color).await;
+    TimerResult::Completed
+}
+
+#[allow(dead_code)]
 async fn run_timer<S>(
     minutes: u32,
     leds: &mut S,
