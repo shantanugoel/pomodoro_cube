@@ -141,9 +141,7 @@ async fn main(spawner: Spawner) -> ! {
     }
 }
 
-// TODO: Implement a sand grain falling animation during the timer countdown.
-//       Go to light or deep sleep after the grain reaches its position till next grain needs to appear
-// TODO: Implement orientation based direction of filling the LEDs (so it fills "downwards" based on cube orientation)
+// TODO: Go to light or deep sleep after the grain reaches its position till next grain needs to appear
 // TODO: Implement light or deep sleep between readings and after completion to save power. Wake up if orientation changes
 // TODO: Stop the timer after it completes and wait for user to move the cube to restart
 // TODO: Detect if orientation changed to another valid one during countdown, and pause timer until settled
