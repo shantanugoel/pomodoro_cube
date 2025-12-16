@@ -11,10 +11,19 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
 use esp_hal::i2c::master::{Config, I2c};
-use esp_hal::rmt::{Rmt, TxChannelConfig, TxChannelCreator};
+use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
+use esp_hal_smartled::SmartLedsAdapter;
 use log::info;
+use pomodoro_cube::qmi8658;
+use smart_leds::RGB8;
+
+const COLOR_SAND: RGB8 = RGB8 { r: 25, g: 15, b: 0 };
+const COLOR_BG: RGB8 = RGB8 { r: 0, g: 0, b: 0 };
+const GRAVITY_THRESHOLD: f32 = 0.85;
+// Buffer Size: 64 LEDs * 24 bits (R,G,B) + 1 Stop Code
+const BUFFER_SIZE: usize = 64 * 24 + 1;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -50,31 +59,63 @@ async fn main(spawner: Spawner) -> ! {
     // Hardware Init
     //LEDs
     let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).expect("Failed to initialize RMT0");
-    let tx_config = TxChannelConfig::default();
-    let _tx_channel = rmt
-        .channel0
-        .configure_tx(peripherals.GPIO4, tx_config)
-        .expect("Failed to create RMT TX Channel");
+    let mut rmt_buffer = [PulseCode::default(); BUFFER_SIZE];
+    let mut led_strip = SmartLedsAdapter::new(rmt.channel0, peripherals.GPIO14, &mut rmt_buffer);
 
     // IMU
-    let _i2c = I2c::new(
+    let i2c = I2c::new(
         peripherals.I2C0,
         Config::default().with_frequency(Rate::from_khz(400)),
     )
     .expect("Failed to create I2c")
     .with_sda(peripherals.GPIO11)
     .with_scl(peripherals.GPIO12);
-    // TODO: Actual IMU init here after writing the driver
+    let mut imu = qmi8658::Qmi8658::new(i2c);
+    if let Err(e) = imu.init() {
+        panic!("Failed to initialize QMI8658: {:?}", e);
+    } else {
+        info!("QMI8658 initialized successfully");
+    }
 
-    info!("Embassy initialized!");
+    info!("Initialized!");
 
     // TODO: Spawn some tasks
     let _ = spawner;
 
     loop {
-        info!("Hello world!");
-        Timer::after(Duration::from_secs(1)).await;
-    }
+        // Read all 3 axes (X, Y, Z)
+        if let Ok((x, y, z)) = imu.read_accel_all() {
+            // LOGIC: Check which axis is feeling gravity (> 0.85g or < -0.85g)
+            // Note: Gravity pulls "Down", so the sensor reads +1g or -1g depending on orientation.
+            info!("X: {:.2}g, Y: {:.2}g, Z: {:.2}g", x, y, z);
 
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v~1.0/examples
+            if y < -GRAVITY_THRESHOLD {
+                // --- CASE 1: Y- is DOWN (Usually the connector side) ---
+                // ACTION: OFF / IDLE
+                Timer::after(Duration::from_millis(500)).await;
+                info!("IDLE");
+            } else if x < -GRAVITY_THRESHOLD {
+                // --- CASE 2: X- is DOWN ---
+                // ACTION: 5 MINUTES
+                info!("5 MINUTES");
+            } else if x > GRAVITY_THRESHOLD {
+                // --- CASE 3: X+ is DOWN ---
+                // ACTION: 30 MINUTES
+                info!("30 MINUTES");
+            } else if y > GRAVITY_THRESHOLD {
+                // --- CASE 4: Y+ is DOWN (Top edge) ---
+                // ACTION: 60 MINUTES
+                info!("60 MINUTES");
+            } else {
+                // --- AMBIGUOUS / TRANSITION ---
+                // Waiting for box to settle
+                info!("SETTLING");
+                Timer::after(Duration::from_millis(200)).await;
+            }
+        } else {
+            // Sensor error retry
+            info!("Sensor read error, retrying...");
+            Timer::after(Duration::from_millis(100)).await;
+        }
+    }
 }
