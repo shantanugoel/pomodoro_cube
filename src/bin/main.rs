@@ -17,9 +17,12 @@ use esp_hal::timer::timg::TimerGroup;
 use esp_hal_smartled::SmartLedsAdapter;
 use log::info;
 use pomodoro_cube::qmi8658;
-use smart_leds::RGB8;
+use smart_leds::{RGB8, SmartLedsWrite};
 
-const COLOR_SAND: RGB8 = RGB8 { r: 25, g: 15, b: 0 };
+// --- CONFIGURATION CONSTANTS ---
+const COLOR_5_MIN: RGB8 = RGB8 { r: 0, g: 20, b: 0 };
+const COLOR_30_MIN: RGB8 = RGB8 { r: 20, g: 10, b: 0 };
+const COLOR_60_MIN: RGB8 = RGB8 { r: 20, g: 0, b: 0 };
 const COLOR_BG: RGB8 = RGB8 { r: 0, g: 0, b: 0 };
 const GRAVITY_THRESHOLD: f32 = 0.85;
 // Buffer Size: 64 LEDs * 24 bits (R,G,B) + 1 Stop Code
@@ -85,27 +88,36 @@ async fn main(spawner: Spawner) -> ! {
     loop {
         // Read all 3 axes (X, Y, Z)
         if let Ok((x, y, z)) = imu.read_accel_all() {
-            // LOGIC: Check which axis is feeling gravity (> 0.85g or < -0.85g)
-            // Note: Gravity pulls "Down", so the sensor reads +1g or -1g depending on orientation.
+            // Check which axis is feeling gravity (> 0.85g or < -0.85g)
+            // Gravity pulls "Down", so the sensor reads +1g or -1g depending on orientation.
             info!("X: {:.2}g, Y: {:.2}g, Z: {:.2}g", x, y, z);
 
+            // TODO: Maybe use Z axis for power down to give an additional time option?
+            // TODO: Batch logging to reduce log spam
             if y < -GRAVITY_THRESHOLD {
-                // --- CASE 1: Y- is DOWN (Usually the connector side) ---
+                // --- CASE 1: Y- is DOWN ---
                 // ACTION: OFF / IDLE
+                fill_matrix(&mut led_strip, COLOR_BG);
                 Timer::after(Duration::from_millis(500)).await;
                 info!("IDLE");
             } else if x < -GRAVITY_THRESHOLD {
                 // --- CASE 2: X- is DOWN ---
                 // ACTION: 5 MINUTES
                 info!("5 MINUTES");
+                flash_color(&mut led_strip, COLOR_5_MIN).await;
+                run_timer(5, &mut led_strip, COLOR_5_MIN).await;
             } else if x > GRAVITY_THRESHOLD {
                 // --- CASE 3: X+ is DOWN ---
                 // ACTION: 30 MINUTES
                 info!("30 MINUTES");
+                flash_color(&mut led_strip, COLOR_30_MIN).await;
+                run_timer(30, &mut led_strip, COLOR_30_MIN).await;
             } else if y > GRAVITY_THRESHOLD {
-                // --- CASE 4: Y+ is DOWN (Top edge) ---
+                // --- CASE 4: Y+ is DOWN ---
                 // ACTION: 60 MINUTES
                 info!("60 MINUTES");
+                flash_color(&mut led_strip, COLOR_60_MIN).await;
+                run_timer(60, &mut led_strip, COLOR_60_MIN).await;
             } else {
                 // --- AMBIGUOUS / TRANSITION ---
                 // Waiting for box to settle
@@ -118,4 +130,74 @@ async fn main(spawner: Spawner) -> ! {
             Timer::after(Duration::from_millis(100)).await;
         }
     }
+}
+
+// TODO: Implement a sand grain falling animation during the timer countdown
+// TODO: Implement orientation based direction of filling the LEDs (so it fills "downwards" based on cube orientation)
+// TODO: Implement light or deep sleep between readings and after completion to save power. Wake up if orientation changes
+// TODO: Detect if orientation changed to another valid one during countdown, and pause timer until settled
+//   and use the new orientation to restart the timer if the orientation changed from previous one
+async fn run_timer<S>(minutes: u32, leds: &mut S, color: RGB8)
+where
+    S: SmartLedsWrite,
+    S::Color: From<RGB8>,
+{
+    let total_seconds = minutes * 60;
+
+    for elapsed in 0..total_seconds {
+        let percent = elapsed as f32 / total_seconds as f32;
+        let pixels_filled = (percent * 64.0) as usize;
+
+        let mut pixels = [COLOR_BG; 64];
+
+        // This fills pixels 0->63 regardless of cube rotation.
+        for (idx, pixel) in pixels.iter_mut().enumerate() {
+            if idx < pixels_filled {
+                *pixel = color;
+            }
+        }
+
+        // Heartbeat
+        if elapsed % 2 == 0 {
+            pixels[63] = RGB8 { r: 5, g: 5, b: 5 };
+        }
+
+        let _ = leds.write(pixels.iter().copied());
+        Timer::after(Duration::from_secs(1)).await;
+    }
+
+    run_breathing_animation(leds, color).await;
+}
+
+async fn run_breathing_animation<S>(leds: &mut S, color: RGB8)
+where
+    S: SmartLedsWrite,
+    S::Color: From<RGB8>,
+{
+    for _ in 0..3 {
+        fill_matrix(leds, color);
+        Timer::after(Duration::from_millis(500)).await;
+        fill_matrix(leds, COLOR_BG);
+        Timer::after(Duration::from_millis(500)).await;
+    }
+}
+
+async fn flash_color<S>(leds: &mut S, color: RGB8)
+where
+    S: SmartLedsWrite,
+    S::Color: From<RGB8>,
+{
+    fill_matrix(leds, color);
+    Timer::after(Duration::from_millis(300)).await;
+    fill_matrix(leds, COLOR_BG);
+    Timer::after(Duration::from_millis(100)).await;
+}
+
+fn fill_matrix<S>(leds: &mut S, color: RGB8)
+where
+    S: SmartLedsWrite,
+    S::Color: From<RGB8>,
+{
+    let pixels = [color; 64];
+    let _ = leds.write(pixels.iter().copied());
 }
