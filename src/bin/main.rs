@@ -82,7 +82,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // Give the host time to enumerate/attach a serial monitor after reset/flash.
     // This wait should be done after esp_rtos::start to ensure the timer is running.
-    Timer::after(Duration::from_secs(2)).await;
+    Timer::after(Duration::from_secs(4)).await;
 
     // Hardware Init
     //LEDs
@@ -176,7 +176,6 @@ async fn main(spawner: Spawner) -> ! {
                 // ACTION: Do nothing / ignore
                 info!("IGNORING Z-AXIS ORIENTATION");
                 //TODO: Maybe go to light sleep until orientation changes?
-                light_sleep_secs(&mut rtc, 1);
             } else {
                 // --- AMBIGUOUS / TRANSITION ---
                 // Waiting for box to settle
