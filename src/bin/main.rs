@@ -10,14 +10,18 @@
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
+use esp_hal::delay::Delay;
 use esp_hal::i2c::master::{Config, I2c};
 use esp_hal::rmt::{PulseCode, Rmt};
+use esp_hal::rtc_cntl::{Rtc, sleep::TimerWakeupSource};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal_smartled::SmartLedsAdapter;
 use log::info;
 use pomodoro_cube::qmi8658;
 use smart_leds::{RGB8, SmartLedsWrite};
+
+use core::time::Duration as CoreDuration;
 
 // --- CONFIGURATION CONSTANTS ---
 const COLOR_5_MIN: RGB8 = RGB8 { r: 0, g: 10, b: 0 };
@@ -28,6 +32,10 @@ const COLOR_BG: RGB8 = RGB8 { r: 0, g: 0, b: 0 };
 const GRAVITY_THRESHOLD: f32 = 0.85;
 // Buffer Size: 64 LEDs * 24 bits (R,G,B) + 1 Stop Code
 const BUFFER_SIZE: usize = 64 * 24 + 1;
+
+// Light sleep can disrupt `espflash monitor` (USB-Serial-JTAG/CDC) because the USB link may drop
+// while the chip sleeps. Keep this OFF while developing/debugging over USB.
+const USE_LIGHT_SLEEP: bool = false;
 
 #[derive(Copy, Clone, Debug)]
 enum FillDirection {
@@ -57,16 +65,24 @@ async fn main(spawner: Spawner) -> ! {
     // generator version: 1.1.0
 
     esp_println::logger::init_logger_from_env();
+    info!("App booted; initializing...");
 
     // System Init
     // Set CPU to 80MHz to save power
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_80MHz);
     let peripherals = esp_hal::init(config);
 
+    // RTC (for true light sleep)
+    let mut rtc = Rtc::new(peripherals.LPWR);
+
     // Runtime Init
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
+
+    // Give the host time to enumerate/attach a serial monitor after reset/flash.
+    // This wait should be done after esp_rtos::start to ensure the timer is running.
+    Timer::after(Duration::from_secs(2)).await;
 
     // Hardware Init
     //LEDs
@@ -108,25 +124,59 @@ async fn main(spawner: Spawner) -> ! {
                 // ACTION: 5 MINUTES
                 info!("5 MINUTES");
                 flash_color(&mut led_strip, COLOR_5_MIN).await;
-                run_timer(5, &mut led_strip, COLOR_5_MIN, FillDirection::Right).await;
+                run_timer(
+                    5,
+                    &mut led_strip,
+                    COLOR_5_MIN,
+                    FillDirection::Right,
+                    &mut rtc,
+                )
+                .await;
             } else if x < -GRAVITY_THRESHOLD {
                 // --- CASE 2: X- is DOWN ---
                 // ACTION: 15 MINUTES
                 info!("15 MINUTES");
                 flash_color(&mut led_strip, COLOR_15_MIN).await;
-                run_timer(15, &mut led_strip, COLOR_15_MIN, FillDirection::Up).await;
+                run_timer(
+                    15,
+                    &mut led_strip,
+                    COLOR_15_MIN,
+                    FillDirection::Up,
+                    &mut rtc,
+                )
+                .await;
             } else if x > GRAVITY_THRESHOLD {
                 // --- CASE 3: X+ is DOWN ---
                 // ACTION: 30 MINUTES
                 info!("30 MINUTES");
                 flash_color(&mut led_strip, COLOR_30_MIN).await;
-                run_timer(30, &mut led_strip, COLOR_30_MIN, FillDirection::Down).await;
+                run_timer(
+                    30,
+                    &mut led_strip,
+                    COLOR_30_MIN,
+                    FillDirection::Down,
+                    &mut rtc,
+                )
+                .await;
             } else if y > GRAVITY_THRESHOLD {
                 // --- CASE 4: Y+ is DOWN ---
                 // ACTION: 60 MINUTES
                 info!("60 MINUTES");
                 flash_color(&mut led_strip, COLOR_60_MIN).await;
-                run_timer(60, &mut led_strip, COLOR_60_MIN, FillDirection::Left).await;
+                run_timer(
+                    60,
+                    &mut led_strip,
+                    COLOR_60_MIN,
+                    FillDirection::Left,
+                    &mut rtc,
+                )
+                .await;
+            } else if !(-GRAVITY_THRESHOLD..=GRAVITY_THRESHOLD).contains(&z) {
+                // --- CASE 5: Z is DOWN/UP ---
+                // ACTION: Do nothing / ignore
+                info!("IGNORING Z-AXIS ORIENTATION");
+                //TODO: Maybe go to light sleep until orientation changes?
+                light_sleep_secs(&mut rtc, 1);
             } else {
                 // --- AMBIGUOUS / TRANSITION ---
                 // Waiting for box to settle
@@ -146,8 +196,13 @@ async fn main(spawner: Spawner) -> ! {
 // TODO: Stop the timer after it completes and wait for user to move the cube to restart
 // TODO: Detect if orientation changed to another valid one during countdown, and pause timer until settled
 //   and use the new orientation to restart the timer if the orientation changed from previous one
-async fn run_timer<S>(minutes: u32, leds: &mut S, color: RGB8, dir: FillDirection)
-where
+async fn run_timer<S>(
+    minutes: u32,
+    leds: &mut S,
+    color: RGB8,
+    dir: FillDirection,
+    rtc: &mut Rtc<'_>,
+) where
     S: SmartLedsWrite,
     S::Color: From<RGB8>,
 {
@@ -176,8 +231,7 @@ where
             continue;
         }
 
-        // "Sleep" until the next grain needs to appear.
-        Timer::after(Duration::from_secs((next_elapsed - elapsed) as u64)).await;
+        sleep_until_next_grain(rtc, next_elapsed - elapsed).await;
         elapsed = next_elapsed;
 
         let filled_after = filled_pixels(elapsed, total_seconds);
@@ -188,6 +242,28 @@ where
     }
 
     run_breathing_animation(leds, color).await;
+}
+
+fn light_sleep_secs(rtc: &mut Rtc<'_>, seconds: u32) {
+    if seconds == 0 {
+        return;
+    }
+
+    let timer = TimerWakeupSource::new(CoreDuration::from_secs(seconds as u64));
+    Delay::new().delay_millis(100);
+    rtc.sleep_light(&[&timer]);
+}
+
+async fn sleep_until_next_grain(rtc: &mut Rtc<'_>, seconds: u32) {
+    if seconds == 0 {
+        return;
+    }
+
+    if USE_LIGHT_SLEEP {
+        light_sleep_secs(rtc, seconds);
+    } else {
+        Timer::after(Duration::from_secs(seconds as u64)).await;
+    }
 }
 
 fn filled_pixels(elapsed: u32, total_seconds: u32) -> usize {
