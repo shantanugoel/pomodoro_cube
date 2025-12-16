@@ -20,13 +20,22 @@ use pomodoro_cube::qmi8658;
 use smart_leds::{RGB8, SmartLedsWrite};
 
 // --- CONFIGURATION CONSTANTS ---
-const COLOR_5_MIN: RGB8 = RGB8 { r: 0, g: 20, b: 0 };
-const COLOR_30_MIN: RGB8 = RGB8 { r: 20, g: 10, b: 0 };
-const COLOR_60_MIN: RGB8 = RGB8 { r: 20, g: 0, b: 0 };
+const COLOR_5_MIN: RGB8 = RGB8 { r: 0, g: 10, b: 0 };
+const COLOR_15_MIN: RGB8 = RGB8 { r: 0, g: 0, b: 10 };
+const COLOR_30_MIN: RGB8 = RGB8 { r: 10, g: 10, b: 0 };
+const COLOR_60_MIN: RGB8 = RGB8 { r: 10, g: 0, b: 0 };
 const COLOR_BG: RGB8 = RGB8 { r: 0, g: 0, b: 0 };
 const GRAVITY_THRESHOLD: f32 = 0.85;
 // Buffer Size: 64 LEDs * 24 bits (R,G,B) + 1 Stop Code
 const BUFFER_SIZE: usize = 64 * 24 + 1;
+
+#[derive(Copy, Clone, Debug)]
+enum FillDirection {
+    Down,
+    Up,
+    Left,
+    Right,
+}
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -96,28 +105,28 @@ async fn main(spawner: Spawner) -> ! {
             // TODO: Batch logging to reduce log spam
             if y < -GRAVITY_THRESHOLD {
                 // --- CASE 1: Y- is DOWN ---
-                // ACTION: OFF / IDLE
-                fill_matrix(&mut led_strip, COLOR_BG);
-                Timer::after(Duration::from_millis(500)).await;
-                info!("IDLE");
-            } else if x < -GRAVITY_THRESHOLD {
-                // --- CASE 2: X- is DOWN ---
                 // ACTION: 5 MINUTES
                 info!("5 MINUTES");
                 flash_color(&mut led_strip, COLOR_5_MIN).await;
-                run_timer(5, &mut led_strip, COLOR_5_MIN).await;
+                run_timer(5, &mut led_strip, COLOR_5_MIN, FillDirection::Right).await;
+            } else if x < -GRAVITY_THRESHOLD {
+                // --- CASE 2: X- is DOWN ---
+                // ACTION: 15 MINUTES
+                info!("15 MINUTES");
+                flash_color(&mut led_strip, COLOR_15_MIN).await;
+                run_timer(15, &mut led_strip, COLOR_15_MIN, FillDirection::Up).await;
             } else if x > GRAVITY_THRESHOLD {
                 // --- CASE 3: X+ is DOWN ---
                 // ACTION: 30 MINUTES
                 info!("30 MINUTES");
                 flash_color(&mut led_strip, COLOR_30_MIN).await;
-                run_timer(30, &mut led_strip, COLOR_30_MIN).await;
+                run_timer(30, &mut led_strip, COLOR_30_MIN, FillDirection::Down).await;
             } else if y > GRAVITY_THRESHOLD {
                 // --- CASE 4: Y+ is DOWN ---
                 // ACTION: 60 MINUTES
                 info!("60 MINUTES");
                 flash_color(&mut led_strip, COLOR_60_MIN).await;
-                run_timer(60, &mut led_strip, COLOR_60_MIN).await;
+                run_timer(60, &mut led_strip, COLOR_60_MIN, FillDirection::Left).await;
             } else {
                 // --- AMBIGUOUS / TRANSITION ---
                 // Waiting for box to settle
@@ -139,36 +148,184 @@ async fn main(spawner: Spawner) -> ! {
 // TODO: Stop the timer after it completes and wait for user to move the cube to restart
 // TODO: Detect if orientation changed to another valid one during countdown, and pause timer until settled
 //   and use the new orientation to restart the timer if the orientation changed from previous one
-async fn run_timer<S>(minutes: u32, leds: &mut S, color: RGB8)
+async fn run_timer<S>(minutes: u32, leds: &mut S, color: RGB8, dir: FillDirection)
 where
     S: SmartLedsWrite,
     S::Color: From<RGB8>,
 {
     let total_seconds = minutes * 60;
 
-    for elapsed in 0..total_seconds {
-        let percent = elapsed as f32 / total_seconds as f32;
-        let pixels_filled = (percent * 64.0) as usize;
+    // Sand animation strategy:
+    // - Only wake when the next "grain" (pixel) needs to be added.
+    // - Animate a single grain falling toward its target position.
+    // This approximates "sleep until next grain" without forcing deep-sleep resets.
 
-        let mut pixels = [COLOR_BG; 64];
+    // Initial render: empty matrix.
+    render_sand_state(leds, 0, None, color, dir);
 
-        // This fills pixels 0->63 regardless of cube rotation.
-        for (idx, pixel) in pixels.iter_mut().enumerate() {
-            if idx < pixels_filled {
-                *pixel = color;
-            }
+    let mut elapsed: u32 = 0;
+    while elapsed < total_seconds {
+        let filled_now = filled_pixels(elapsed, total_seconds);
+        if filled_now >= 64 {
+            break;
         }
 
-        // Heartbeat
-        if elapsed % 2 == 0 {
-            pixels[63] = RGB8 { r: 5, g: 5, b: 5 };
+        // Compute when the next pixel should be added (ceil division).
+        let next_elapsed = next_elapsed_for_filled(filled_now + 1, total_seconds);
+        if next_elapsed <= elapsed {
+            // Shouldn't happen, but avoid getting stuck.
+            elapsed += 1;
+            continue;
         }
 
-        let _ = leds.write(pixels.iter().copied());
-        Timer::after(Duration::from_secs(1)).await;
+        // "Sleep" until the next grain needs to appear.
+        Timer::after(Duration::from_secs((next_elapsed - elapsed) as u64)).await;
+        elapsed = next_elapsed;
+
+        let filled_after = filled_pixels(elapsed, total_seconds);
+        if filled_after > filled_now {
+            let target_fill_index = filled_after - 1;
+            animate_grain_to_fill_index(leds, target_fill_index, filled_after, color, dir).await;
+        }
     }
 
     run_breathing_animation(leds, color).await;
+}
+
+fn filled_pixels(elapsed: u32, total_seconds: u32) -> usize {
+    // Integer progress mapping: 0..64 over 0..total_seconds.
+    // At elapsed == total_seconds, this becomes 64.
+    ((elapsed as u64 * 64) / (total_seconds as u64)) as usize
+}
+
+fn next_elapsed_for_filled(next_filled: usize, total_seconds: u32) -> u32 {
+    // Solve for minimal t such that floor(t*64/total_seconds) >= next_filled.
+    // t >= ceil(next_filled*total_seconds/64)
+    let numerator = (next_filled as u64) * (total_seconds as u64);
+    numerator.div_ceil(64) as u32
+}
+
+async fn animate_grain_to_fill_index<S>(
+    leds: &mut S,
+    target_fill_index: usize,
+    filled_count: usize,
+    color: RGB8,
+    dir: FillDirection,
+) where
+    S: SmartLedsWrite,
+    S::Color: From<RGB8>,
+{
+    // Determine the target cell for this grain.
+    let (target_row, target_col) = coord_for_fill_index(target_fill_index, dir);
+
+    // Start on the side opposite gravity, then fall toward the target.
+    let (mut row, mut col) = match dir {
+        FillDirection::Down => (0usize, target_col),
+        FillDirection::Up => (7usize, target_col),
+        FillDirection::Left => (target_row, 7usize),
+        FillDirection::Right => (target_row, 0usize),
+    };
+
+    // Step toward the target with a short animation.
+    // Keep total animation short to preserve the "sleepy" behavior.
+    for _ in 0..8 {
+        render_sand_state(
+            leds,
+            filled_count.saturating_sub(1),
+            Some((row, col)),
+            color,
+            dir,
+        );
+
+        if row == target_row && col == target_col {
+            break;
+        }
+
+        match dir {
+            FillDirection::Down => {
+                if row < target_row {
+                    row += 1;
+                }
+            }
+            FillDirection::Up => {
+                if row > target_row {
+                    row -= 1;
+                }
+            }
+            FillDirection::Left => {
+                if col > target_col {
+                    col -= 1;
+                }
+            }
+            FillDirection::Right => {
+                if col < target_col {
+                    col += 1;
+                }
+            }
+        }
+
+        Timer::after(Duration::from_millis(35)).await;
+    }
+
+    // Final state with the new pixel committed.
+    render_sand_state(leds, filled_count, None, color, dir);
+}
+
+fn render_sand_state<S>(
+    leds: &mut S,
+    filled_count: usize,
+    grain: Option<(usize, usize)>,
+    color: RGB8,
+    dir: FillDirection,
+) where
+    S: SmartLedsWrite,
+    S::Color: From<RGB8>,
+{
+    let mut pixels = [COLOR_BG; 64];
+
+    // Fill the "pile" starting from the gravity side.
+    let fill_limit = core::cmp::min(filled_count, 64);
+    for fill_index in 0..fill_limit {
+        let (row, col) = coord_for_fill_index(fill_index, dir);
+        let idx = physical_index(row, col);
+        pixels[idx] = color;
+    }
+
+    // Draw the falling grain on top.
+    if let Some((row, col)) = grain
+        && row < 8
+        && col < 8
+    {
+        let idx = physical_index(row, col);
+        pixels[idx] = color;
+    }
+
+    let _ = leds.write(pixels.iter().copied());
+}
+
+fn coord_for_fill_index(fill_index: usize, dir: FillDirection) -> (usize, usize) {
+    // Maps a linear "pile growth" index (0..63) to a row/col based on gravity direction.
+    // Assumes an 8x8 logical matrix.
+    let major = fill_index / 8;
+    let minor = fill_index % 8;
+
+    match dir {
+        // Gravity pulls toward row 7, so we fill row 7 -> 0.
+        FillDirection::Down => (7 - major, minor),
+        // Gravity pulls toward row 0, so we fill row 0 -> 7.
+        FillDirection::Up => (major, minor),
+        // Gravity pulls toward col 0, so we fill col 0 -> 7.
+        FillDirection::Left => (minor, major),
+        // Gravity pulls toward col 7, so we fill col 7 -> 0.
+        FillDirection::Right => (minor, 7 - major),
+    }
+}
+
+fn physical_index(row: usize, col: usize) -> usize {
+    // Logical row/col to LED buffer index.
+    // Assumes simple row-major wiring (0..7 left->right, then next row).
+    // If your matrix is serpentine, adjust this mapping.
+    (row * 8) + col
 }
 
 async fn run_breathing_animation<S>(leds: &mut S, color: RGB8)
