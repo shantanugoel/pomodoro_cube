@@ -392,6 +392,9 @@ where
     // Initial render: empty matrix.
     render_sand_state(leds, 0, None, color, dir);
 
+    // Immediately animate the first pixel for instant visual feedback.
+    animate_grain_to_fill_index(leds, 0, 1, color, dir).await;
+
     let mut elapsed: u32 = 0;
 
     while elapsed < total_seconds {
@@ -591,16 +594,21 @@ async fn sleep_until_next_grain(rtc: &mut Rtc<'_>, seconds: u32) {
 }
 
 fn filled_pixels(elapsed: u32, total_seconds: u32) -> usize {
-    // Integer progress mapping: 0..64 over 0..total_seconds.
-    // At elapsed == total_seconds, this becomes 64.
-    ((elapsed as u64 * 64) / (total_seconds as u64)) as usize
+    // First pixel shown immediately, remaining 63 distributed over full duration.
+    // At elapsed == 0: returns 1
+    // At elapsed == total_seconds: returns 64
+    1 + ((elapsed as u64 * 63) / (total_seconds as u64)) as usize
 }
 
 fn next_elapsed_for_filled(next_filled: usize, total_seconds: u32) -> u32 {
-    // Solve for minimal t such that floor(t*64/total_seconds) >= next_filled.
-    // t >= ceil(next_filled*total_seconds/64)
-    let numerator = (next_filled as u64) * (total_seconds as u64);
-    numerator.div_ceil(64) as u32
+    // First pixel is at t=0, so for pixels 2-64 we use 63 intervals.
+    // Solve for minimal t such that 1 + floor(t*63/total_seconds) >= next_filled.
+    // t >= ceil((next_filled - 1)*total_seconds/63)
+    if next_filled <= 1 {
+        return 0;
+    }
+    let numerator = ((next_filled - 1) as u64) * (total_seconds as u64);
+    numerator.div_ceil(63) as u32
 }
 
 async fn animate_grain_to_fill_index<S>(
