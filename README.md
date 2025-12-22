@@ -10,6 +10,7 @@ A physical timer cube with visual feedback designed to help with time management
   - USB-C connector for power and programming
   - 3.7v Battery (Optional, but useful for no-wires usage)
   - A LIPO Battery charger (Optional, but useful to charge the battery without having to take the device apart)
+    - I am using a clone of Adafruit USB C Lipo Charger (4410) and the back part of case is designed for the same
 
 - **QMI8658 IMU** (accelerometer/gyroscope)
   - Connected via I2C on GPIO11 (SDA) and GPIO12 (SCL)
@@ -68,6 +69,8 @@ When you flip the cube to a different valid side during a timer, it restarts wit
 ![](pomodoro-cube-circuit-diagram.png)
 
 #### 3D Printed Case STl files
+
+[Pomodoro Cube STL Files](https://makerworld.com/en/models/2145201-pomodoro-cube-adhd-timer-case-for-esp32-matrix#profileId-2324085)
 
 
 #### Software
