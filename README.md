@@ -8,6 +8,8 @@ A physical timer cube with visual feedback designed to help with time management
   - Includes built-in 8x8 WS2812B LED matrix (GPIO14)
   - ESP32-S3 microcontroller
   - USB-C connector for power and programming
+  - 3.7v Battery (Optional, but useful for no-wires usage)
+  - A LIPO Battery charger (Optional, but useful to charge the battery without having to take the device apart)
 
 - **QMI8658 IMU** (accelerometer/gyroscope)
   - Connected via I2C on GPIO11 (SDA) and GPIO12 (SCL)
@@ -60,6 +62,15 @@ When you flip the cube to a different valid side during a timer, it restarts wit
    ```
 
 ### Building
+
+#### Hardware Connections
+
+![](pomodoro-cube-circuit-diagram.png)
+
+#### 3D Printed Case STl files
+
+
+#### Software
 
 Build the project with:
 ```bash
